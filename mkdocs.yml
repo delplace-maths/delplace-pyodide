@@ -1,0 +1,11 @@
+site_name: Delplace Pyodide - Cours & TP
+theme:
+  name: pyodide-mkdocs-theme
+
+plugins:
+  - pyodide_macros:
+      # Options par défaut pour le plugin Pyodide
+
+nav:
+  - Accueil: index.md
+  - TP 1 : pythontp1.md
