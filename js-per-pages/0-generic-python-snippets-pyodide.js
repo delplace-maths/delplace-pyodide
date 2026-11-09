@@ -1,0 +1,886 @@
+/*
+pyodide-mkdocs-theme
+Copyleft GNU GPLv3 🄯 2024 Frédéric Zinelli
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.
+If not, see <https://www.gnu.org/licenses/>.
+*/
+
+
+import { jsLogger } from 'jsLogger'
+import { escapeSquareBrackets } from 'functoolsTxt'
+
+
+
+
+
+export const pyodideFeatureCode=(()=>{
+
+    const PYODIDE_SNIPPETS = {
+
+
+    /**Creates the PyodideConsole, which is the runtime tool behind any "terminal", and setup
+     * the JS routines so that Runners can interact with it.
+     *
+     * https://pyodide.org/en/stable/usage/api/python-api/console.html#pyodide.console.PyodideConsole
+     *
+     *
+     * Routines are stored in `globalThis.pyFuncs`, which is also `PyodideSectionsRunner.pyFuncs`.
+     * The global version will be deleted after use, unless `CONFIG._devMode` is true.
+     * The available routines are:
+     *
+     *      - `redirect_cmd(cmd:string)` to run commands written by a user in the terminal.
+     *
+     *      - `complete(cmd:string)` to ask for an array of all the possible auto-completion
+     *         suggestions for the given command (currently typed in the terminal by a user).
+     *
+     *      - `clear_console()` to cancel the PyodideConsole current buffer, if ever needed
+     *        (for example: an incomplete command triggering an error about imports => the previous
+     *         parts of the command need to be cancelled).
+     *
+     * Archive note: in earlier implementations of pyodideStart, `__builtins__` was behaving here like
+     * a dict instead of an object because pyodide.runPython(...) was run using a dedicated namespace
+     *  object (second argument).
+     * */
+    pyodideStart: `
+def _hack_start_pyodide():
+    import js
+    import __main__
+    from pyodide.console import PyodideConsole, repr_shorten
+    from pyodide.ffi import to_js
+
+
+    # Globals initializations:
+    __builtins__._ = None
+    __builtins__.__USER_CMD__ = __builtins__.__USER_CODE__ = ""
+
+    # Store some original python functions:
+    for name in 'input print help'.split():
+        src_func = getattr(__builtins__, name)
+        setattr(__builtins__, f"__{ name }_src__", src_func)
+
+
+    py_console = PyodideConsole(__main__.__dict__)
+
+
+    async def redirect_cmd(cmd):
+
+        fut = py_console.push(cmd)
+        state = fut.syntax_check
+
+        if state != 'incomplete':
+            res = await fut             # Raising is desired if error
+            if res is not None:
+                __builtins__._ = res
+                if js.config().cutFeedback:
+                    res = repr_shorten(res)
+                print(res)
+
+        return state
+
+    def complete(cmd:str):
+        # Avoids some crashes on autocompletion requests on previous results of the autocompletion...
+        cmd = cmd.rstrip('(')
+        out = py_console.complete(cmd)
+        return to_js(out[0])
+
+    def clear_console():
+        py_console.buffer = []
+
+
+    # Proxies created once only per page, so don't care about destroying them:
+    js.pyFuncs.redirect_cmd = to_js(redirect_cmd)
+    js.pyFuncs.clear_console = to_js(clear_console)
+    js.pyFuncs.complete = to_js(complete)
+
+_hack_start_pyodide()
+del _hack_start_pyodide     # (no auto_run tool yet)
+`,
+
+
+    /**Replace on the fly pyodide.http.pyfetch and js.fetch with wrappers that will consider any
+     * value set in `CONFIG.relUrlRedirect` to prepend it to the urls given as arguments to the
+     * wrappers, before actually fetching the address. Only relative urls are affected.
+     *
+     * `{FORMAT_TOKEN}` must be given as a python boolean string.
+     *   - If False, accessing js.fetch will return a wrapper equivalent to the `pyfetch` one.
+     *   - If True, this behavior is also added: any access to the js.document and subsequent
+     *     accesses will return a Mock object.
+     * */
+    relUrlsRedirections: `
+def __hack_redirection_and_fake_js():
+    import re, js
+    from functools import wraps
+    from pathlib import Path
+    import pyodide.http as http
+
+    if not {WITH_REDIRECT}:
+        __builtins__.teardown_url_redirections = lambda *_: None
+        return
+
+    with_js_mock = {FORMAT_TOKEN}
+    inputs       = {HACK_PROMPT}
+    pure_pyfetch = http.pyfetch
+    pure_import  = __import__
+    js_config    = js.config()
+
+
+    def get_url(url: str|Path):
+        if isinstance(url,Path):
+            url = str(url)
+        if isinstance(url,str) and not re.match(r'(https?|ftps?|file)://|www[.]', url):
+            url = js.config().relUrlRedirect + url
+        # print(url)
+        return url
+
+
+    @wraps(pure_pyfetch)
+    async def fake_pyfetch(url, *a, **kw):
+        url = get_url(url)
+        return await pure_pyfetch(url, *a, **kw)
+
+    http.pyfetch = fake_pyfetch
+
+
+    async def fake_js_fetch(url, *a):
+        url = get_url(url)
+        return await js.fetch(url, *a)
+
+
+    class JsMock(int):
+        """
+        Extends int so that computations when pyplot tries to update the DOM do not crash
+        (even if wrong...!)
+        """
+
+        # ASYNC_CALLS = set('uploaderAsync'.split())
+
+        def __getattr__(self, k):
+            if k=='fetch':
+                return fake_js_fetch
+
+            # if k in self.ASYNC_CALLS:
+            #     return self.async_sink_js
+
+            if k=='prompt' and inputs:
+                return lambda *a,**kw: inputs.pop()
+
+            if with_js_mock and (k=='document' or self is sink_js ):
+                return sink_js
+
+            return getattr(js, k)
+
+        async def async_sink_js(self, *a,**kw):
+            return sink_js
+
+        def __call__(self, *a, **kw):
+            return sink_js
+
+        def __setattr__(self, k,v):     # (why is that needed?)
+            setattr(js, k, v)
+
+
+    fake_js = JsMock(1)
+    sink_js = JsMock(1)  # Using another instance, to get the fetch behavior at top level only
+
+    def fake_import(name, *a, **kw):
+        if name == 'js':
+            return fake_js
+        return pure_import(name, *a, **kw)
+
+    __builtins__.__import__ = fake_import
+
+
+    def teardown_url_redirections():
+        js_config.relUrlRedirect = ''
+        http.pyfetch = pure_pyfetch
+        __builtins__.__import__ = pure_import
+
+    __builtins__.teardown_url_redirections = teardown_url_redirections
+
+
+__hack_redirection_and_fake_js()
+del __hack_redirection_and_fake_js
+`,
+
+    autoRun: `
+def _hack_auto_run():
+    import inspect
+
+    G = globals()
+
+    class AutoRunner:
+        run = set()
+        coros = []
+
+        def __call__(self, func):
+            self.run.add(func.__name__)
+            if inspect.iscoroutinefunction(func):
+                self.coros.append(func)
+            else:
+                func()
+
+        def clean(self):
+            for k in self.run:
+                if k in G: del G[k]
+            self.run.clear()
+
+        def __repr__(self):
+            return "AutoRunner()"
+
+        async def loop_async(self):
+            coros = self.coros[:]
+            self.coros.clear()
+            for func in coros: await func()
+
+
+    # Keep uncleaned elements:
+    runner = AutoRunner()
+
+    # Since this snippet will be run for each new section, always transfer existing traced
+    # calls to the new object:
+    if hasattr(__builtins__, 'auto_run'):
+        runner.run |= __builtins__.auto_run.run
+    __builtins__.auto_run = runner
+
+
+    def as_builtin(name_or_func):
+        """
+        Automatically add the decorated function in the builtins module. Usage:
+
+        \`\`\`python
+        @as_builtin
+        def func(...): pass     # declare __builtins__.func
+
+        @as_builtin("actual_name")
+        def func(...): pass     # declare __builtins__.actual_name = func
+        \`\`\`
+        """
+
+        if not isinstance(name_or_func, str):
+            return as_builtin(name_or_func.__name__)(name_or_func)
+        return lambda func: setattr(__builtins__, name_or_func, func) or func
+
+
+    __builtins__.as_builtin = as_builtin
+
+
+    @as_builtin
+    def wraps_builtin(
+        *args,
+        source=None,
+        store=True,
+        name="",
+    ):
+        """
+        Build a singleton object that mimics as much as possible an original builtin,
+        defining repr, str, dir, __name__ and __qualname__ behaviors of the builtin function.
+        Can also be used with user defined functions, to get a custom \`repr\` value which
+        doesn't show some horrible \`<function _hack_xxx.<locals>.some_func>\` to the user
+        when printed in the terminal.
+
+        \`type\` and \`help\` give slightly different behaviors:
+            * \`type(func)\` is showing the BuiltinWrapperXxx name
+            * \`help(func)\` is showing the original docstring of func if defined, or the builtin's
+               help message, wrapped inside the BuiltinWrapperXxx class layout
+
+        @source:        The function to "mimic". Generally a builtin, but might be any function
+                        that needs to have custom str and repr behaviors.
+        @store=True:    If True, added to __builtins__ with builtin.__name__ as property name.
+        """
+
+        def wrapper(func):
+
+            builtin_src = f"__{ func.__name__ }_src__"
+            is_builtin  = hasattr(__builtins__, builtin_src)
+
+            if is_builtin:
+                src       = source or getattr(__builtins__, f"__{ func.__name__ }_src__")
+                func_name = name or getattr(src, '__name__', func.__name__)
+            else:
+                src       = source or func
+                func_name = name or getattr(src, '__name__', func.__name__)
+
+
+            class BuiltinWrapper:
+
+                def __init__(self):
+                    self.func = func
+                    self.__name__ = self.__qualname__ = func_name
+
+                    # Keep any already defined docstring:
+                    self.__class__.__doc__ = func.__doc__ or source and source.__doc__
+
+                def __call__(self, *a,**kw):  return self.func(*a,**kw)
+                def __dir__(self):            return dir(src)
+                def __repr__(self):
+                    if is_builtin and func_name!='help':
+                        return repr(src)
+                    return f"<function {func_name}>"
+
+            kls_name = "BuiltinWrapper" + func_name.capitalize()
+            BuiltinWrapper.__name__ = BuiltinWrapper.__qualname__ = kls_name
+
+            wrapped = BuiltinWrapper()
+            if store:
+                as_builtin(func_name)(wrapped)
+            return wrapped
+
+
+        if len(args)>1 or args and (not callable(args[0]) or source or name):
+            raise ValueError(
+                "Invalid call for @wraps_builtin: shouldn't be used with positional arguments,"
+                " unless it's the function to wrap."
+            )
+        return wrapper(args[0]) if args else wrapper
+
+_hack_auto_run()
+del _hack_auto_run
+`,
+
+
+    autoRunCleaner: `__builtins__.auto_run.clean()`,
+
+
+    version: `
+def version(get_version=False):
+    """ Print (also returns) the current version number of pyodide-mkdocs-theme. """
+    out = "pyodide-mkdocs-theme v${ CONFIG.version }"
+    print(out)
+    if get_version:
+        return out
+`,
+
+
+    localStorageRelays: `
+@auto_run
+def _hack_local_storage_routines():
+    import js
+
+    for prop in 'get set del'.split():
+        routine = getattr(js, prop+'Storage')
+        as_builtin(prop+'_storage')(routine)
+
+    @as_builtin
+    def keys_storage():
+        return js.keysStorage().to_py()
+`,
+
+
+    ioStuff: `
+@auto_run
+def _hack_io_stuff():
+
+    import js, re
+    from pydoc import render_doc
+    from typing import Any
+
+    @wraps_builtin
+    def input(question:str="", beginning:str=""):
+        question = question or ""           # Original is using None so, just in case...
+        result = js.prompt(f"{ beginning }{ question }")
+        print(f"{ question }{ result }")    # Must ensure string conversion of result
+        return result
+
+
+    @wraps_builtin
+    def help(object_or_function):
+        """
+        Replace the original help function, which doesn't work as expected within pyodide.
+        """
+
+        class_name = getattr(type(object_or_function), '__name__', '')
+        prefix     = 'BuiltinWrapper'
+        if class_name.startswith(prefix):
+            func_name = class_name[len(prefix):].lower()
+            if func_name == 'help':
+                object_or_function = object_or_function.func
+            else:
+                src_name = f"__{ func_name }_src__"
+                object_or_function    = getattr(__builtins__, src_name, None) or object_or_function.func
+
+        name = getattr(object_or_function, '__name__', None)
+        if name is None or name not in PMT_TOOLS:
+            doc = render_doc(object_or_function)
+        else:
+            doc = object_or_function.__doc__
+        print(re.sub(r"\x08.", "", doc))
+
+
+    PMT_TOOLS = ['MocodoPmt', 'PyodidePlotPmt', 'foliumPmt', 'p5', 'p5v2', 'vis', 'vis_network']      # GENERATED
+
+
+    @wraps_builtin
+    def terminal_message(key, *msg:Any, format:str=None, sep:str=' ', end:str=None, new_line:bool=True, **__):
+        """
+        Display the given message directly into the terminal, without using the python stdout.
+        This allows to give informations to the user even if the stdout is deactivated during
+        a validation.
+
+        @key:      Value to pass to allow the use of the function when the stdout is deactivated.
+        @*msg:     Any number of elements to display in the terminal.
+        @format:   One of the predefined formatting options for the terminal:
+                   "error", "warning", "info", "italic", "stress", "success", "none" (default)
+        @sep=' ':  Equivalent to \`print(..., sep=...)\`
+        @end=None: Close to \`print(..., end=...)\`. If not used, the @new_line argument will apply.
+                   Otherwise, @new_line will be False, and @end will control the end of the
+                   displayed message.
+        @new_line: _Legacy behavior_: this argument is now useless and can be replaced with the
+                   use of \`end\`. If False, no new line character is added after the @msg content.
+        @returns:  None
+        """
+
+        # NOTE: arguments are used as sinks when using terminal_message as a replacement for print
+        msg = sep.join(map(str, msg))
+        if end is not None:
+            new_line = False
+            msg += end
+        try:
+            js.config().termMessage(key, msg, format or 'none', False, new_line)
+        except Exception as e:
+            msg = str(e)
+            target = 'Error: '      # Error might be Error, or PythonError
+            i = msg.find(target)
+            if i<0: i = -len(target)
+            stripped_js_err = msg[ i+len(target): ]
+            raise Exception(stripped_js_err) from None
+`,
+
+
+    copyFromServer: `
+@auto_run
+def _hack_copy_from_server():
+    from pathlib import Path
+
+    @as_builtin
+    async def copy_from_server(
+        src: str|Path,
+        dest: str = ".",
+        name: str = "",
+    ):
+        from pyodide.http import pyfetch
+        from pathlib import Path
+        from urllib.error import URLError
+
+        src = str(src)      # convert potential arguments as Path
+        response = await pyfetch(src)
+        if not response.ok:
+            raise URLError(f"Failed request for { src }.")
+
+        content  = await response.bytes()
+        target   = Path(dest) / (name or Path(src).name)
+            # Note: Path(src).name works to extract the name file on urls, but the path
+            #       is actually invalid as an url: "http://xx" givers "http:/xx".
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+`,
+
+
+    exclusionsTools: `
+@auto_run
+def _hack_exclusions_tools():
+
+    type = __builtins__.type      # avoid restrictions troubles
+
+    @wraps_builtin
+    def __move_forward__(x):
+        treasure = __builtins__.__builtins___
+        if type(x) is str and x in treasure:
+            return treasure[x][0]
+
+    @as_builtin
+    class ExclusionError(Exception):
+        @staticmethod
+        def throw(that:str, head=None):
+            if head is None:
+                head = "don't use "
+            raise ExclusionError(f"${ CONFIG.MSG.exclusionMarker }: { head }{ that }")
+`,
+
+
+    refresher: `
+@auto_run
+def _hack_scope_cleaner():
+
+    # Avoid restrictions troubles:
+    set = __builtins__.set
+    globals = __builtins__.globals
+
+    @wraps_builtin
+    def clear_scope(keep=()):
+        """
+        Remove any new function or variable from the global scope, keeping only:
+
+        - Variables and functions that were defined after the start of the environment.
+        - Elements present in the @keep argument (Iterable).
+        """
+        keeper = set(keep) | {
+            '__name__', '__doc__', '__package__', '__loader__', '__spec__',
+            '__annotations__', '__builtins__', '_pyodide_core', 'version'
+        }
+        g_dct = globals()
+        for k in set(g_dct) - keeper:
+            del g_dct[k]
+`,
+
+    clearScope: `clear_scope()`,
+
+
+    wantedImports: `__import__('pyodide').code.find_imports({FORMAT_TOKEN})`,
+
+
+    alreadyImported: `" ".join(__import__('sys').modules.keys())`,
+
+
+    upDownLoader: `
+@auto_run
+def _hack_uploader_downloader():
+
+    import js
+    from pyodide.ffi import create_proxy
+    from typing import Callable, Any, Literal
+    from argparse import Namespace
+
+    class ReadAs(Namespace):
+        txt = 'readAsText'
+        bytes = 'readAsArrayBuffer'
+        img = 'readAsDataURL'
+
+        @classmethod
+        def get_props(cls):
+            return ', '.join(
+                repr(p) for p in dir[cls] if not p.startswith('_') and p != 'get_props'
+            )
+
+    def wrapping(
+        cbk: Callable[[str],Any],
+        *,
+        read_as: Literal["txt","bytes","img"] = 'txt',
+        with_name:bool = False,
+        multi:bool = False,
+    ):
+        read_method = getattr(ReadAs, read_as, None)
+        if not read_method:
+            raise ValueError(
+                f"Invalid read_as argument: {read_as!r}. Available options are: {ReadAs.get_props()}"
+            )
+
+        def wrapper(content:str, filename:str, is_last:bool):
+
+            if read_method == ReadAs.bytes:
+                content = bytes(js.Uint8Array.new(content))
+
+            args = (content, filename) if with_name else (content,)
+            out.append(cbk(*args))
+
+            if is_last:
+                proxy_cbk.destroy()
+
+        proxy_cbk = create_proxy(wrapper)    # Does NOT work when using pyodide.ffi.create_once_callable
+        out = []
+
+        return (proxy_cbk, read_method, multi), lambda: out
+
+
+    @as_builtin
+    async def pyodide_uploader_async(
+        cbk: Callable[[str],Any],
+        *,
+        read_as: Literal["txt","bytes","img"] = 'txt',
+        with_name:bool = False,
+        multi:bool = False,
+    ) -> Any :
+        '''
+        Async uploader, to import files into pyodide environment. The files are available right
+        after the function call.
+
+        @cbk: receive the content of a file (as str, bytes or DataURL, depending on @read_as), and
+        possibly the filename (if @with_name is True). It can return an output of any kind.
+
+        @read_as: set the input type of the @cbk first argument:
+        - "txt": sends str
+        - "bytes": sends bytes
+        - "img"; sends the content of an image file as a DataURL, that can be directly inserted
+        into an img tag.
+
+        @with_name=False: if True, @cbk must accept an extra argument, which will be the name of
+        the uploaded file.
+
+        @multi=False: if True, several files can be uploaded at once. In that case, @cbk returns
+        a tuple of the output for each file.
+
+        @returns: the output of @cbk, as a tuple if @multi is True.
+        '''
+
+        js_args, out_getter = wrapping(cbk, read_as=read_as, with_name=with_name, multi=multi)
+        await js.uploaderAsync(*js_args)
+        out = out_getter()
+        if multi:
+            return tuple(out)
+        return out.pop() if out else None
+
+
+
+    @as_builtin
+    def pyodide_uploader(
+        cbk: Callable[[str],None],
+        *,
+        read_as: Literal["txt","bytes","img"] = 'txt',
+        with_name:bool = False,
+        multi:bool = False,
+    ) -> None :
+        '''
+        Sync version of the uploader, to import files into pyodide environment. The files are
+        available only after the PMT sections have all been completed (meaning, after the post
+        section).
+
+        @cbk: receive the content of a file (as str, bytes or DataURL, depending on @read_as), and
+        possibly the filename (if @with_name is True). Any action related to handling the files
+        content must be done from within this callback.
+
+        @read_as: set the input type of the @cbk first argument:
+        - "txt": sends str
+        - "bytes": sends bytes
+        - "img"; sends the content of an image file as a DataURL, that can be directly inserted
+        into an img tag.
+
+        @with_name=False: if True, @cbk must accept an extra argument, which will be the name of
+        the uploaded file.
+
+        @multi=False: if True, several files can be uploaded at once. In that case, @cbk returns
+        a tuple of the output for each file.
+
+        @returns: Nothing.
+        '''
+        js_args, _ = wrapping(cbk, read_as=read_as, with_name=with_name, multi=multi)
+        js.uploader(*js_args)
+
+
+
+    @as_builtin
+    def pyodide_downloader(
+        content:str|bytes|list[int],
+        filename:str,
+        type="text/plain"
+    ) -> None :
+        '''
+        Send content from pyodide to the user's download directory.
+
+        @content: the content to send to the user (str, bytes, list[int], bytearray).
+
+        @filename: the name of the downloaded file.
+
+        @type_mime: type of the downloaded file. See:
+        https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types
+        '''
+        if not isinstance(content, str):
+            content = js.Uint8Array.new(content)
+        js.downloader(content, filename, type)
+`,
+
+
+    mermaidDrawer: `
+@auto_run
+def _hack_mermaid():
+    import js
+
+    @as_builtin
+    def mermaid_figure(div_id:str=None):
+        """
+        Create a Callable[[str],None] that will draw the given mermaid code into the wanted figure div.
+        """
+        div_id = div_id or js.config().argsFigureDivId
+
+        def to_mermaid(code:str, debug=False):
+            if debug: print(code)
+            code = f'<pre class="mermaid">{ code }</pre>'
+            js.document.getElementById(div_id).innerHTML = code
+            js.config().calledMermaid = True
+
+        return to_mermaid
+
+    try:
+        if js.config().needMermaid:
+            js.mermaid
+
+        else:
+            @as_builtin
+            def mermaid_figure(*_,**__):
+                raise ValueError(
+                     "The function mermaid_figure cannot be used because there is no mermaid "
+                    +"registration in the page.\\nDon't forget to mark the markdown page "
+                    +"by using the argument 'MERMAID=True' in one of the macros (IDE, IDEv, "
+                    +"terminal or py_btn)"
+                )
+    except:
+        raise ValueError(
+            "Cannot create mermaid logistic: the js mermaid object doesn't exist."
+            +"\\nDon't forget to mark the markdown page by using the argument "
+            +"'MERMAID=True' in one of the macros (IDE, IDEv, terminal or py_btn)"
+        )
+`,
+
+
+    setupStdIO: `
+@auto_run
+def _hack_stdout_up():
+    import sys, io, js
+
+    # Keep a StringIO object there (this also allows to enforce a flush of the stdout content
+    # in between runs/sections, on user's side, and redactors wanting to test against the user
+    # stdout will also use this:
+    __builtins__.src_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+
+    # Different object allowing to spot what to print exactly, for one single call to print:
+    __builtins__.per_call_std_out = io.StringIO()
+
+
+    @wraps_builtin
+    def print(*a,**kw):     # Note: wraps doesn't seem to work... Dunno why...)
+
+        # First, blindly print to the actual stdout (in case the author is using it)
+        __print_src__(*a,**kw)
+
+        # Then print to the one used to get proper formatting (according to the generic
+        # behavior of python print function):
+        kw['file'] = per_call_std_out
+        __print_src__(*a, **kw)
+
+        # Then extract the formatted content to write to the terminal and empty per_call_std_out:
+        properly_formatted = per_call_std_out.getvalue()
+        per_call_std_out.truncate(0)
+        per_call_std_out.seek(0)
+        js.config().termMessage(None, properly_formatted, 'none', True)
+`,
+
+
+    teardownStdIO:`
+@__builtins__.auto_run
+def _hack_stdout_down():
+    import sys
+
+    sys.stdout.close()
+    sys.stdout = __builtins__.src_stdout
+    del __builtins__.src_stdout
+
+    __builtins__.per_call_std_out.close()
+    __builtins__.print = __builtins__.__print_src__
+`,
+    }
+
+    const validReplString = (r) => (r??null) !== null
+
+    /**@replacements: content to use in place of `{FORMAT_TOKEN}` (one arg only), or an array
+     * of two elements, `[target, repl]`, target being the target string to replace in the code,
+     * and repl being the data to insert.
+     *
+     * WARNING: pass the repl values as JS objects: they are converted with `JSON.stringify(...)`.
+     * */
+    return (option, ...replacements)=>{
+        LOGGER_CONFIG.ACTIVATE && jsLogger('[CheckPoint] - Pyodide feature:', option)
+        let code = PYODIDE_SNIPPETS[option]
+        if(code===undefined){
+            throw new Error(`Unknown snippet: ${option}`)
+        }
+        replacements.filter( r=>validReplString(!Array.isArray(r) ? r : r[1]) )
+                    .forEach((data,i)=>{
+            const isArr = Array.isArray(data)
+            if(i && !isArr){
+                throw new Error(
+                    "`pyodideFeatureCode` replacement values must be arrays after the first one: [to_replace,replacement]."
+                )
+            }
+            const [token,repl] = isArr ? data : ["{FORMAT_TOKEN}", data]
+
+            /* WARNING: DO NOT use string.replace here, because if ever the repl contains some
+                        specific RegExp characters (like... `$`), those will cause a mess in
+                        the replacement (even if they are escaped first).
+            */
+            const joiner = typeof(repl)=='boolean' ? _.capitalize(''+repl) : JSON.stringify(repl)
+            code = code.split(token).join(joiner)
+        })
+        return code + "\n"
+    }
+})()
+
+
+
+
+
+
+
+
+/*
+------------------------------------------------------------------
+          Various helpers, centralizing some logic
+------------------------------------------------------------------
+*/
+
+
+export const pyodideFeatureRunCode=(name, repl=null)=>{
+    const code = pyodideFeatureCode(name, repl)
+    return pyodide.runPython(code)
+}
+
+
+
+export const pyodideFeatureSetupRedirections=(relUrlRedirection, withJsMock, withInputs=null)=>{
+
+    const withRedirection = Boolean(relUrlRedirection)
+
+    CONFIG.relUrlRedirect = `${ CONFIG.baseUrl }/${ relUrlRedirection||"" }/`.replace(/[/]{2}/g, '/')
+    // Replace "//"" to ease the way for the user: no need to care about adding or not trailing
+    // or leading slashes.
+
+    const replacements = [
+        withJsMock,
+        ['{WITH_REDIRECT}', withRedirection],
+        ['{HACK_PROMPT}', (withInputs ? withInputs.reverse():false)]
+    ]
+    const code = pyodideFeatureCode("relUrlsRedirections", ...replacements)
+    pyodide.runPython(code)
+}
+
+
+
+
+
+
+
+
+/*
+------------------------------------------------------------------
+          Manage python stdout redirection in terminal
+------------------------------------------------------------------
+*/
+
+
+/**Use a StringIO stdout, so that the full content can be extracted later.
+ * */
+export const setupStdIO =_=>{       // WARNING: some arguments may be passed in silently here or there
+    pyodideFeatureRunCode('autoRun')
+    pyodideFeatureRunCode('setupStdIO')
+}
+
+export const teardownStdIO =_=>{
+    pyodideFeatureRunCode('teardownStdIO')
+}
+
+export const clearPyodideScope=()=>{
+    pyodideFeatureRunCode('autoRun')
+    pyodideFeatureRunCode('refresher')
+    pyodideFeatureRunCode('clearScope')
+}
