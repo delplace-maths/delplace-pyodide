@@ -12,16 +12,18 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
       - name: Configurer Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
-      - name: Installer les dépendances
+
+      - name: Installer MkDocs et le thème Pyodide
         run: |
-          pip install mkdocs-pyodide-mkdocs-theme
-          
-      - name: Déployer sur GitHub Pages
+          python -m pip install --upgrade pip
+          pip install mkdocs pyodide-mkdocs-theme
+
+      - name: Compiler et déployer
         run: mkdocs gh-deploy --force
