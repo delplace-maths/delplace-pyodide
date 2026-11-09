@@ -1,10 +1,15 @@
 site_name: Delplace Pyodide - Cours & TP
+
 theme:
   name: pyodide-mkdocs-theme
 
 plugins:
+  - search
   - pyodide_macros:
-      # Options par défaut pour le plugin Pyodide
+      project:
+        id: "delplace-pyodide"
+      build:
+        ides_id_hash_mode: "relative"
 
 nav:
   - Accueil: index.md
