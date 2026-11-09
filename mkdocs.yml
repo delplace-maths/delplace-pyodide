@@ -1,4 +1,5 @@
 site_name: Delplace Pyodide - Cours & TP
+site_url: https://delplace-maths.github.io/delplace-pyodide/
 
 theme:
   name: pyodide-mkdocs-theme
